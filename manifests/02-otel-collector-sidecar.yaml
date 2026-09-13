@@ -1,0 +1,42 @@
+# PREREQUISITES (one-time, cluster-wide):
+#   1) cert-manager (the OTel Operator needs it for webhook certs):
+#      kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+#   2) OpenTelemetry Operator:
+#      kubectl apply -f https://github.com/open-telemetry/opentelemetry-operator/releases/latest/download/opentelemetry-operator.yaml
+#
+# The operator watches for OpenTelemetryCollector custom resources. When one
+# is created with mode: sidecar, any pod in the same namespace carrying the
+# annotation:
+#     sidecar.opentelemetry.io/inject: "otel-sidecar"
+# (the value is this CR's name) gets an extra container injected automatically
+# that listens on localhost:4317 (gRPC) / localhost:4318 (HTTP) — no manual
+# sidecar container definition needed in your Deployment/Job specs.
+
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel-sidecar
+  namespace: default
+spec:
+  mode: sidecar
+  config:
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      batch: {}
+    exporters:
+      otlp/tempo:
+        endpoint: tempo.default.svc.cluster.local:4317
+        tls:
+          insecure: true
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [otlp/tempo]

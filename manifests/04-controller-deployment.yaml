@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: foo-controller
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: foo-controller
+  template:
+    metadata:
+      labels:
+        app: foo-controller
+      annotations:
+        sidecar.opentelemetry.io/inject: "otel-sidecar"
+    spec:
+      serviceAccountName: tracing-demo
+      containers:
+        - name: controller
+          image: tracing-demo-controller:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "localhost:4317"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

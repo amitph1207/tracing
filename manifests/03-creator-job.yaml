@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: foo-creator
+  namespace: default
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      annotations:
+        # This is the annotation that triggers sidecar injection — the
+        # operator matches it against the OpenTelemetryCollector named
+        # "otel-sidecar" in 02-otel-collector-sidecar.yaml.
+        sidecar.opentelemetry.io/inject: "otel-sidecar"
+    spec:
+      serviceAccountName: tracing-demo
+      restartPolicy: Never
+      containers:
+        - name: creator
+          image: tracing-demo-creator:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NAMESPACE
+              value: "default"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "localhost:4317"
