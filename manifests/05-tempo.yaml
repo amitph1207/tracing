@@ -15,11 +15,6 @@ data:
               endpoint: 0.0.0.0:4317
             http:
               endpoint: 0.0.0.0:4318
-    ingester:
-      max_block_duration: 5m
-    compactor:
-      compaction:
-        block_retention: 1h
     storage:
       trace:
         backend: local
@@ -45,7 +40,7 @@ spec:
     spec:
       containers:
         - name: tempo
-          image: grafana/tempo:latest
+          image: grafana/tempo:2.6.1
           args: ["-config.file=/etc/tempo/tempo.yaml"]
           ports:
             - containerPort: 3200  # query API / Grafana datasource
@@ -81,3 +76,4 @@ spec:
     - name: otlp-http
       port: 4318
       targetPort: 4318
+
