@@ -10,6 +10,11 @@ persisted progress, retries, two tracing policies, and an explicit rollout span.
 Your supplied notes in `tracing*.md`, merge-request examples, and the reference
 `operatortrace/` checkout are left intact.
 
+Read [tracing concepts](#trace-ids-span-ids-and-traceparent), follow the
+[controller handoffs](#what-actually-passes-between-the-controllers), then use the
+[code walkthrough](#navigate-the-code). The [span lifetime explanation](#when-does-a-span-end-what-is-a-rollout-span)
+and [experiments](#experiments-and-expected-results) connect the code to its traces.
+
 ## Trace IDs, span IDs and traceparent
 
 | Term | Meaning | In this lab |
@@ -57,25 +62,28 @@ sequenceDiagram
     participant C1 as Foo controller
     participant C2 as Bar controller
     participant C3 as Baz controller
-    Creator->>Creator: start foo.rollout and create-foo
-    Creator->>API: create Foo: message + submission context
-    API-->>Creator: accepted; end create-foo
-    API-->>C1: Foo watch notification / queued key
-    C1->>API: GET Foo; extract its annotation context
-    C1->>C1: start reconcile; do demo work
-    C1->>API: create Bar: message + CURRENT span context + owner reference
-    C1->>API: Foo status: observedGeneration + childName
-    C1->>C1: end reconcile
-    API-->>C2: Bar watch notification / queued key
-    C2->>API: GET Bar; extract its annotation context
-    C2->>API: create Baz: message + CURRENT span context + owner reference
-    C2->>API: Bar status: observedGeneration + childName
-    C2->>C2: end reconcile
-    API-->>C3: Baz watch notification / queued key
-    C3->>API: GET Baz; extract context, do work, publish completion
-    C3->>C3: end reconcile
-    Creator->>API: poll Foo → Bar → Baz for completion of this operation
-    Creator->>Creator: ready; end foo.rollout
+    Creator->>Creator: Start foo.rollout and create-foo
+    Creator->>API: Create Foo with message and submission context
+    API-->>Creator: Foo accepted
+    Creator->>Creator: Finish create-foo span
+    API-->>C1: Foo watch notification and queued key
+    C1->>API: GET Foo and extract its annotation context
+    C1->>C1: Start reconcile span and do demo work
+    C1->>API: Create Bar with current span context and owner reference
+    C1->>API: Update Foo status with observedGeneration and childName
+    C1->>C1: Finish reconcile span
+    API-->>C2: Bar watch notification and queued key
+    C2->>API: GET Bar and extract its annotation context
+    C2->>API: Create Baz with current span context and owner reference
+    C2->>API: Update Bar status with observedGeneration and childName
+    C2->>C2: Finish reconcile span
+    API-->>C3: Baz watch notification and queued key
+    C3->>API: GET Baz and extract its annotation context
+    C3->>C3: Start reconcile span and do demo work
+    C3->>API: Publish Baz completion status
+    C3->>C3: Finish reconcile span
+    Creator->>API: Poll the Foo Bar Baz chain for completion
+    Creator->>Creator: Observe readiness and finish foo.rollout span
 ```
 
 The three Deployments watch **different kinds**:
@@ -182,6 +190,28 @@ a backend may receive later spans with the same trace ID. Backend retention,
 late-arrival handling and tail-sampling windows still limit what you will see.
 See the [OpenTelemetry tracing API](https://opentelemetry.io/docs/specs/otel/trace/api/).
 
+A trace is a collection of spans sharing a trace ID, not a distributed transaction
+with an owner that can close every participant. The creator cannot know whether
+a controller will retry or produce delayed work, so each participant ends its
+own spans independently.
+
+| Situation | Meaning and consequence |
+| --- | --- |
+| Every span has ended and no more arrive | The trace is historical telemetry. There is no live trace object waiting to be closed. |
+| Code forgets to call `span.End()` | That span has an instrumentation bug. The normal SDK processor/export path does not receive it as a completed span. |
+| New spans reuse one trace ID for months | The trace grows logically and mixes unrelated operations. Use bounded operation traces and links between them. |
+| A backend's retention period expires | Stored telemetry can be removed even though an application still has the trace ID in an annotation. |
+
+**No `EndTrace` does not mean indefinite storage or an immortal open transaction.**
+Late-arrival behavior, retention, trace-size limits and tail-sampling windows are
+backend/pipeline concerns. Do not assume an arbitrarily late span will be retained
+or displayed together with all earlier spans. Our boundary is one desired-state
+operation; a new operation gets a new trace.
+
+`span.End()` controls telemetry timing. **Context cancellation controls work.**
+Ending a span does not cancel a Kubernetes API call or stop another controller.
+The timeout example deliberately demonstrates that distinction.
+
 Do not keep a reconcile span open across several retries or while waiting for a
 cloud operation for hours. End each attempt and persist an operation ID/context
 for the next attempt. A rollout span is useful only when a component actually
@@ -250,6 +280,260 @@ and leave old annotations in place, controller 1 starts a new root instead of
 joining the old trace. That root is then handed down to controllers 2 and 3.
 Existing objects with unqualified `traceparent` annotations from the old demo
 also take this fallback; new creator jobs use qualified annotation keys.
+
+## Navigate the code
+
+Read these files in order, starting with `child` mode and the successful `chain`
+scenario. Then return to the retry and `linked` branches.
+
+| File | Responsibility |
+| --- | --- |
+| [internal/tracing/tracing.go](internal/tracing/tracing.go) | Our utility wrappers around OpenTelemetry |
+| [cmd/creator/main.go](cmd/creator/main.go) | Start one rollout, submit Foo and observe completion |
+| [cmd/controller/main.go](cmd/controller/main.go) | Watch one kind, reconcile it and create the next resource |
+| [internal/demo/demo.go](internal/demo/demo.go) | Resource selection, generation checks, names and chain readiness |
+
+### OTel objects versus our utilities
+
+Keep these types separate as you read:
+
+| Object | Purpose |
+| --- | --- |
+| `TracerProvider` | Configures sampling, processing and exporting for this process |
+| `Tracer` | Creates spans; obtaining one does not start a trace |
+| `Span` | One operation, with a start time and an `End()` method |
+| `SpanContext` | Tracing identity: trace ID, span ID, flags and tracestate |
+| `context.Context` | Go's in-process carrier for cancellation and the current span |
+
+A tracer is reusable across many operations. A span context is identity, not a
+live handle to the sending process's span. Extracting it cannot resume or end
+that span.
+
+These functions are **our code**, built on top of OTel:
+
+| Our utility | What it does | Starts or ends a span? |
+| --- | --- | --- |
+| [`Init`](internal/tracing/tracing.go#L19) | Configures the exporter, sampling, batching and service name | Neither |
+| [`InjectToMap`](internal/tracing/tracing.go#L54) | Serializes the current span's identity into traceparent and tracestate | Neither |
+| [`ExtractFromMap`](internal/tracing/tracing.go#L66) | Parses those fields and returns a context carrying the remote identity | Neither |
+| [`InjectAnnotations`](internal/tracing/tracing.go#L77) | Adds our annotation prefix and preserves unrelated annotations | Neither |
+| [`ExtractAnnotations`](internal/tracing/tracing.go#L90) | Reads our prefixed annotations and calls `ExtractFromMap` | Neither |
+| [`StartAttempt`](internal/tracing/tracing.go#L99) | Chooses a parent or link, then calls `tracer.Start` | Starts one span |
+
+`otel.Tracer`, `tracer.Start`, `span.End`, `span.RecordError`, `span.SetStatus`,
+`span.SetAttributes` and the `trace.With...` options come from OTel itself.
+There is no custom `StartRollout` function: `foo.rollout` is an ordinary span
+with an application-specific name and lifetime.
+
+### Process initialization: `Init`
+
+Read [`Init`](internal/tracing/tracing.go#L19) by its blocks:
+
+1. Read `OTEL_EXPORTER_OTLP_ENDPOINT`, defaulting to `localhost:4317`.
+2. Create an OTLP/gRPC exporter to send telemetry to that destination.
+3. Attach `service.name` to distinguish creator and controller telemetry.
+4. Create a provider with parent-based sampling and a batching processor.
+5. Register the provider globally and configure W3C trace-context propagation.
+6. Return `tp.Shutdown` so the process can flush and close its telemetry pipeline.
+
+`resource.New(...)` here constructs **telemetry metadata**, such as the service
+name. It does not create a Kubernetes resource. The propagation helpers explicitly
+use `propagation.TraceContext{}` to serialize and parse W3C context.
+
+The creator and each controller call `Init` once when their process starts.
+Their deferred shutdown code uses a fresh context with a 10-second timeout so
+flushing can run even if the controller's working context has been cancelled.
+
+**Shutdown does not end application spans.** `span.End()` finishes one operation;
+provider shutdown flushes already-completed spans and closes the exporter.
+The deferred calls are arranged so the creator ends its rollout before shutting
+down the provider. See the [OTel SDK lifecycle](https://opentelemetry.io/docs/specs/otel/trace/sdk/).
+
+### Creator: start the root, submit Foo, then wait
+
+In [`creator.run`](cmd/creator/main.go#L31), the opening blocks initialize tracing,
+create the Kubernetes client, read experiment settings, and prepare Foo. For an
+update, the code can add a link to the previous operation's stored context.
+
+The normal trace starts at this statement:
+
+```go
+ctx, rollout := otel.Tracer("crd-creator").Start(
+    ctx,
+    "foo.rollout",
+    append(options, trace.WithNewRoot())...,
+)
+defer rollout.End()
+```
+
+| Expression | How to read it |
+| --- | --- |
+| `otel.Tracer("crd-creator")` | Obtain a tracer from the configured provider |
+| `.Start(...)` | Create a span |
+| `"foo.rollout"` | Give the span a meaningful operation name |
+| `trace.WithNewRoot()` | Request a new trace even if the incoming context contains a span |
+| Returned `ctx` | A new Go context containing this rollout span |
+| Returned `rollout` | The span handle used to attach information and end the measurement |
+| `defer rollout.End()` | End this span when `run()` returns, including on an error return |
+
+OTel generates the trace ID and span ID. The root's returned context is passed
+to [`submitAndWait`](cmd/creator/main.go#L118), which creates a submission span:
+
+```go
+submitCtx, submit := otel.Tracer("crd-creator").Start(ctx, action+"-foo")
+```
+
+Because `ctx` already carries the rollout and this call does not request a new
+root, `create-foo` or `update-foo` is its child. It keeps the trace ID and receives
+a new span ID.
+
+Next, `tracing.InjectAnnotations(submitCtx, obj.GetAnnotations())` serializes the
+**submission span's** context into Foo. The creator adds the generation binding
+and operation ID, then sends spec and annotations together in Create or Update.
+The missing, invalid and unsampled branches deliberately alter that handoff for
+the relevant experiments.
+
+`submit.End()` runs as soon as the API call returns. It does not wait for Foo's
+controller, Bar or Baz. The rollout span continues while the creator polls.
+
+[`demo.ChainReady`](internal/demo/demo.go#L101) follows Foo's and Bar's child
+pointers and checks that the entire current chain has completed. This is
+application readiness logic; it creates or ends no spans. The polling also
+rejects a replaced Foo or newer generation, so old work cannot satisfy a new
+rollout.
+
+Once polling succeeds, times out, is cancelled, or returns an error, `run()`
+returns and its deferred `rollout.End()` executes. Errors are recorded and set
+the rollout span's status to Error before it ends.
+
+### Controller: start and finish one attempt
+
+All three controllers use the same binary. `CONTROLLER_STAGE` selects Foo, Bar
+or Baz. [`controller.run`](cmd/controller/main.go#L35) initializes tracing,
+starts the informer, queues resource keys, and invokes `reconcile`. Failed
+attempts are requeued with backoff.
+
+Read [`reconcile`](cmd/controller/main.go#L103) in this order:
+
+1. Split the queued key into namespace and name, then GET current state.
+2. Use `demo.Eligible` to skip a deleting object or an already-completed generation.
+3. Determine the attempt number from persisted status.
+4. Call `demo.Incoming` to validate the annotation generation and read its context.
+5. Start an attempt span and attach kind, UID, generation and correlation attributes.
+6. Do demo work and, for Foo or Bar, create the next resource.
+7. Record completion or failure in status and return.
+
+The central tracing calls are:
+
+```go
+incoming := demo.Incoming(u, stage)
+ctx, span := tracing.StartAttempt(
+    ctx, tracer, stageName+".reconcile",
+    demo.Setting(u, "mode"), incoming,
+    // Span attributes are passed here in the implementation.
+)
+defer span.End()
+```
+
+The returned `ctx` now carries **this attempt's span**. That is why both
+`work(ctx, ...)` and `ensureChild(ctx, ...)` receive it: nested work and outgoing
+annotations must use the current attempt, not its upstream sender.
+
+`defer span.End()` runs on success and on ordinary error returns. An error status
+does not itself end a span: `RecordError` adds exception information, `SetStatus`
+marks the operation as failed, and `End` finishes its timing. Each retry starts
+a fresh span rather than reopening the previous one.
+
+### Inside `StartAttempt`: parent or link
+
+[`StartAttempt`](internal/tracing/tracing.go#L99) begins with:
+
+```go
+remote := trace.SpanContextFromContext(
+    ExtractFromMap(context.Background(), carrier),
+)
+```
+
+This parses the incoming identity in a separate context. It does not create a
+recording span. The worker's cancellation and values are preserved through the
+original `ctx` used below.
+
+In `child` mode, `trace.ContextWithRemoteSpanContext(ctx, remote)` places that
+identity into the worker context as the parent. In `linked` mode,
+`trace.WithNewRoot()` requests a separate trace and `trace.WithLinks(...)` adds a
+relationship to the valid remote span. Missing or invalid input has no valid
+remote parent or link.
+
+The last line, `return tracer.Start(ctx, name, attrs...)`, is the actual OTel
+span-creation call. In child mode, valid input supplies the trace ID and parent
+span ID; OTel creates a new span ID. Without valid input it creates a new root.
+
+### Nested work and the outgoing child
+
+[`work`](cmd/controller/main.go#L161) calls:
+
+```go
+_, span := tracer.Start(ctx, "write-to-disk")
+```
+
+The work span is a child of the reconcile span carried by `ctx`. Its deferred
+function records a work error if necessary and then calls `span.End()`. The
+returned context is discarded because there are no deeper instrumented calls
+inside `work` that need it.
+
+[`ensureChild`](cmd/controller/main.go#L191) constructs Bar or Baz, assigns its
+owner reference, injects the current reconcile context, and creates it. This
+function creates no additional span; its execution is measured within reconcile.
+The tracing handoff is this line:
+
+```go
+annotations := tracing.InjectAnnotations(ctx, parent.GetAnnotations())
+```
+
+This helper copies unrelated annotations but replaces traceparent and tracestate.
+Bar receives Foo's controller span ID, and Baz receives Bar's controller span ID.
+For an already-existing child from a prior attempt, the code verifies ownership
+and preserves the original creating context rather than rewriting history.
+
+### The remaining demo helpers
+
+These functions support the lab rather than define OTel's span lifecycle:
+
+| Helper in `internal/demo/demo.go` | Purpose |
+| --- | --- |
+| `Client`, `Env` | Kubernetes client setup and environment configuration |
+| `Resource`, `Kind`, `StageName` | Map the controller stage to its resource and name |
+| `Number`, `Text`, `Setting`, `SettingNumber` | Read object fields and annotations |
+| `Eligible` | Decide whether this resource generation needs work |
+| `Incoming` | Reject stale tracing annotations and return the valid carrier |
+| `OperationID` | Supply a correlation attribute; it does not generate an OTel trace ID |
+| `ChildName`, `OwnedBy` | Make retries reuse the correct child and verify ownership |
+| `ChainReady` | Decide whether the creator's observed rollout has completed |
+
+### Reading path for one complete operation
+
+```text
+tracing.Init
+    ↓
+creator.run: start foo.rollout
+    ↓
+submitAndWait: start create-foo → inject into Foo → finish create-foo
+    ↓
+controller.reconcile: read context → StartAttempt
+    ↓
+work: start and finish a nested work span
+    ↓
+ensureChild: inject current context into Bar or Baz
+    ↓
+reconcile returns → finish attempt span
+    ↓
+creator observes ChainReady → finish foo.rollout
+```
+
+With a manually created Foo that has no valid trace annotations, Foo's controller
+starts a new trace at `StartAttempt`. Bar and Baz can continue it in child mode,
+but that path has no creator-owned rollout span. In linked mode each reconcile
+starts a separate trace with an upstream link when valid context is available.
 
 ## Deploy the lab
 
