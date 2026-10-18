@@ -651,6 +651,14 @@ specific releases compatible with your Kubernetes version.
 
     docker push registry.iximiuz.com/tracing-demo/creator:v1
     docker push registry.iximiuz.com/tracing-demo/controller:v1
+   
+    sed -i \
+  -e 's|image: tracing-demo-creator:local|image: registry.iximiuz.com/tracing-demo/creator:v1|g' \
+  -e 's|image: tracing-demo-controller:local|image: registry.iximiuz.com/tracing-demo/controller:v1|g' \
+  manifests/03-creator-job.yaml \
+  manifests/04-controller-deployment.yaml \
+  manifests/scenarios/*.yaml
+
    ```
 
    ```bash
