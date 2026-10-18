@@ -541,28 +541,101 @@ Use a test cluster and check your selected context first. The manifests use the
 `default` namespace, local images, demo RBAC, ephemeral Tempo storage and anonymous
 Grafana access.
 
-1. Install cert-manager and the OpenTelemetry Operator using their installation
-   instructions (links/commands are in `manifests/02-otel-collector-sidecar.yaml`).
-   Wait for their deployments and webhooks to be ready.
-2. Apply the infrastructure and updated CRD:
+Run the following steps from the repository root. The installation URLs use
+`latest`, matching the lab manifests. For repeatable installations, choose
+specific releases compatible with your Kubernetes version.
+
+1. **Confirm the cluster and check for existing installations.**
 
    ```bash
    kubectl config current-context
+   kubectl get nodes
+   kubectl get deployments -n cert-manager
+   kubectl get deployments -n opentelemetry-operator-system
+   ```
+
+   A namespace-not-found message is expected if that component is not installed.
+   If it is already installed, skip its installation command and run the readiness
+   checks instead.
+
+2. **Install cert-manager and wait for its components.**
+   See the [official cert-manager installation instructions](https://cert-manager.io/docs/installation/kubectl/).
+
+   ```bash
+   kubectl apply -f \
+     https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+
+   kubectl rollout status deployment/cert-manager \
+     -n cert-manager --timeout=300s
+
+   kubectl rollout status deployment/cert-manager-cainjector \
+     -n cert-manager --timeout=300s
+
+   kubectl rollout status deployment/cert-manager-webhook \
+     -n cert-manager --timeout=300s
+   ```
+
+   If `cmctl` is installed, also check API-server connectivity to the webhook:
+
+   ```bash
+   cmctl check api --wait=2m
+   ```
+
+   Expected message: `The cert-manager API is ready`. This performs a dry-run
+   certificate request. The operator certificate check in the next step also
+   verifies that cert-manager can issue the certificate needed by the operator.
+
+3. **Install the OpenTelemetry Operator after cert-manager is ready.**
+   See the [official operator installation instructions](https://opentelemetry.io/docs/platforms/kubernetes/operator/).
+
+   ```bash
+   kubectl apply -f \
+     https://github.com/open-telemetry/opentelemetry-operator/releases/latest/download/opentelemetry-operator.yaml
+
+   kubectl wait --for=condition=Established \
+     crd/opentelemetrycollectors.opentelemetry.io \
+     --timeout=120s
+
+   kubectl wait --for=condition=Ready certificates.cert-manager.io \
+     --all -n opentelemetry-operator-system \
+     --timeout=300s
+
+   kubectl rollout status deployment/opentelemetry-operator-controller-manager \
+     -n opentelemetry-operator-system --timeout=300s
+   ```
+
+4. **Verify the operator webhook and apply the lab infrastructure.**
+   The server-side dry run exercises validation and matching admission webhooks
+   without saving the collector resource. Continue once it succeeds.
+
+   ```bash
+   kubectl apply --dry-run=server \
+     -f manifests/02-otel-collector-sidecar.yaml
+
    kubectl apply -f manifests/00-crd.yaml
-   kubectl wait --for=condition=Established crd/foos.example.com crd/bars.example.com crd/bazs.example.com --timeout=60s
+   kubectl wait --for=condition=Established \
+     crd/foos.example.com crd/bars.example.com crd/bazs.example.com \
+     --timeout=60s
+
    kubectl apply -f manifests/01-rbac.yaml
    kubectl apply -f manifests/02-otel-collector-sidecar.yaml
+   kubectl get opentelemetrycollectors.opentelemetry.io \
+     -n default otel-sidecar
+
    kubectl apply -f manifests/05-tempo.yaml
    kubectl apply -f manifests/06-grafana.yaml
    kubectl rollout status deploy/tempo --timeout=120s
    ```
 
-3. Build images and load them into your cluster:
+   The `otel-sidecar` resource configures collector injection. Collector containers
+   appear when the annotated controller Pods are created in step 6.
+
+5. **Build images and load them into your cluster.**
+   Choose one command for your destination:
 
    ```bash
    ./build.sh                             # build only
-   # Or choose one destination:
-   LOAD_TARGET=kind ./build.sh
+   # LOAD_TARGET=kind ./build.sh
    # LOAD_TARGET=minikube ./build.sh
    # LOAD_TARGET=k3d K3D_CLUSTER=my-cluster ./build.sh
    # LOAD_TARGET=ssh REMOTE_NODES='node-01 node-02' ./build.sh
@@ -572,7 +645,7 @@ Grafana access.
    explicitly. For a registry-based cluster, push images and change manifest image
    fields. `go.sum` is included for reproducible dependency resolution.
 
-4. Start the three controllers and submit the first operation:
+6. **Start the three controllers and submit the first operation.**
 
    ```bash
    kubectl apply -f manifests/04-controller-deployment.yaml
@@ -584,6 +657,21 @@ Grafana access.
    kubectl get foos.example.com,bars.example.com,bazs.example.com
    kubectl get foo foo-chain -o yaml
    ```
+
+If an installation or readiness check fails, stop at that step and inspect the
+relevant component before continuing:
+
+```bash
+kubectl get pods -n cert-manager
+kubectl get events -n cert-manager --sort-by=.metadata.creationTimestamp
+
+kubectl get pods -n opentelemetry-operator-system
+kubectl get certificates -n opentelemetry-operator-system
+kubectl get events -n opentelemetry-operator-system --sort-by=.metadata.creationTimestamp
+
+kubectl logs deployment/opentelemetry-operator-controller-manager \
+  -n opentelemetry-operator-system --all-containers --tail=100
+```
 
 The controller Pods use injected collector sidecars. Short-lived creator Jobs
 export directly to Tempo: a classic injected sidecar can keep a completed Job
