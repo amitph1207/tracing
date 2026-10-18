@@ -633,6 +633,26 @@ specific releases compatible with your Kubernetes version.
 5. **Build images and load them into your cluster.**
    Choose one command for your destination:
 
+
+   ```bash
+    go version
+    docker info
+    LOAD_TARGET=none bash ./build.sh
+
+
+    docker images tracing-demo-creator
+    docker images tracing-demo-controller
+
+    docker tag tracing-demo-creator:local \
+        registry.iximiuz.com/tracing-demo/creator:v1
+
+    docker tag tracing-demo-controller:local \
+      registry.iximiuz.com/tracing-demo/controller:v1
+
+    docker push registry.iximiuz.com/tracing-demo/creator:v1
+    docker push registry.iximiuz.com/tracing-demo/controller:v1
+   ```
+
    ```bash
    ./build.sh                             # build only
    # LOAD_TARGET=kind ./build.sh
