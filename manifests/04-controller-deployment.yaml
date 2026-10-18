@@ -21,6 +21,78 @@ spec:
           image: tracing-demo-controller:local
           imagePullPolicy: IfNotPresent
           env:
+            - name: CONTROLLER_STAGE
+              value: "1"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "localhost:4317"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: foo-controller-2
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: foo-controller-2
+  template:
+    metadata:
+      labels:
+        app: foo-controller-2
+      annotations:
+        sidecar.opentelemetry.io/inject: "otel-sidecar"
+    spec:
+      serviceAccountName: tracing-demo
+      containers:
+        - name: controller
+          image: tracing-demo-controller:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: CONTROLLER_STAGE
+              value: "2"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "localhost:4317"
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: foo-controller-3
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: foo-controller-3
+  template:
+    metadata:
+      labels:
+        app: foo-controller-3
+      annotations:
+        sidecar.opentelemetry.io/inject: "otel-sidecar"
+    spec:
+      serviceAccountName: tracing-demo
+      containers:
+        - name: controller
+          image: tracing-demo-controller:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: CONTROLLER_STAGE
+              value: "3"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "localhost:4317"
           volumeMounts:

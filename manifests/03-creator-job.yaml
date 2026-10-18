@@ -6,12 +6,6 @@ metadata:
 spec:
   backoffLimit: 1
   template:
-    metadata:
-      annotations:
-        # This is the annotation that triggers sidecar injection — the
-        # operator matches it against the OpenTelemetryCollector named
-        # "otel-sidecar" in 02-otel-collector-sidecar.yaml.
-        sidecar.opentelemetry.io/inject: "otel-sidecar"
     spec:
       serviceAccountName: tracing-demo
       restartPolicy: Never
@@ -23,4 +17,8 @@ spec:
             - name: NAMESPACE
               value: "default"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: "localhost:4317"
+              value: "tempo.default.svc.cluster.local:4317"
+            - name: FOO_NAME
+              value: "foo-chain"
+            - name: DELAY_MILLIS
+              value: "250"

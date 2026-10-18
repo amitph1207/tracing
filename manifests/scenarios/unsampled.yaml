@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: foo-unsampled
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      serviceAccountName: tracing-demo
+      restartPolicy: Never
+      containers:
+        - name: creator
+          image: tracing-demo-creator:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NAMESPACE
+              value: "default"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "tempo.default.svc.cluster.local:4317"
+            - name: FOO_NAME
+              value: "foo-unsampled"
+            - name: DELAY_MILLIS
+              value: "250"
+            - name: CONTEXT_MODE
+              value: "unsampled"

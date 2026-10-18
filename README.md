@@ -1,109 +1,441 @@
-# tracing-demo
+# Kubernetes tracing lab
 
-Minimal end-to-end example: a Go program creates a `Foo` custom resource,
-a controller reconciles it, and both sides show up as one connected trace
-in Tempo — even though they never call each other directly, only exchange
-state through the CRD.
+A runnable Go/OpenTelemetry lab for following one desired-state change through
+three Kubernetes controllers: **Foo → Bar → Baz**. Each resource has only
+`spec.message` (a string). The controllers communicate through the API server,
+not direct RPCs. Tempo stores the spans; Grafana shows the traces.
 
-## What's in here
+The original one-controller example now includes a queue, update handling,
+persisted progress, retries, two tracing policies, and an explicit rollout span.
+Your supplied notes in `tracing*.md`, merge-request examples, and the reference
+`operatortrace/` checkout are left intact.
 
+## Trace IDs, span IDs and traceparent
+
+| Term | Meaning | In this lab |
+| --- | --- | --- |
+| Trace ID | 16 bytes, represented by 32 hex characters; groups spans | One desired-state operation in `child` mode |
+| Span ID | 8 bytes, represented by 16 hex characters; identifies one span | New for every submission, attempt and work span |
+| Parent span ID | The span an individual span follows | Controller 2 follows controller 1's successful reconcile |
+| `traceparent` | Serialized trace ID, sending span ID and flags, plus format version | Stored in each resource's annotations, then extracted by its controller |
+| `tracestate` | Optional vendor-specific tracing state | Propagated alongside valid traceparent; usually absent |
+| Span link | Relationship to another span, possibly in a different trace | Used by `linked` mode and by a new update operation |
+
+For example:
+
+```text
+00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+│  │                                │                └ sampled flag
+│  │                                └ sending span's ID
+│  └ trace ID
+└ version
 ```
-cmd/creator/main.go       # creates a Foo, stashes trace context in annotations
-cmd/controller/main.go    # watches Foo, extracts trace context, writes to /tmp
-internal/tracing/         # shared OTel init/inject/extract helpers
-Dockerfile.creator
-Dockerfile.controller
-build.sh                  # builds images, loads into kind/minikube/k3d
-manifests/
-  00-crd.yaml                    # the Foo CRD
-  01-rbac.yaml                   # ServiceAccount + RBAC
-  02-otel-collector-sidecar.yaml # OpenTelemetry Operator CR (sidecar mode)
-  03-creator-job.yaml            # one-shot Job that creates a Foo
-  04-controller-deployment.yaml  # long-running controller
-  05-tempo.yaml                  # Tempo (monolithic, local storage)
-  06-grafana.yaml                # Grafana pre-wired with a Tempo datasource
+
+On receipt, controller 1 extracts the sender's context and starts a **new span**.
+With the child policy, its trace ID stays the same and its parent is the sending
+span. When controller 1 injects context onward, traceparent contains controller
+1's own span ID. Merely copying the original annotation would make controllers
+2 and 3 siblings under the original sender, losing the intended chain.
+These fields and their validation come from [W3C Trace Context](https://www.w3.org/TR/trace-context/).
+
+`context.Context` is the in-process carrier for cancellation and the active span.
+It does not cross the API server. `Inject` serializes the span context; `Extract`
+restores it on the other side. An annotation carries identity, **not a live span**.
+It cannot end, resume, or export the sender's span.
+
+The Pod annotation `sidecar.opentelemetry.io/inject` is different: it asks the
+OpenTelemetry Operator to add a collector container. It carries no trace identity.
+The Foo's `tracing.example.com/traceparent` is the actual context carrier. Kubernetes
+does not automatically copy HTTP trace headers into object annotations.
+
+## What actually passes between the controllers?
+
+```mermaid
+sequenceDiagram
+    participant Creator
+    participant API as Kubernetes API
+    participant C1 as Foo controller
+    participant C2 as Bar controller
+    participant C3 as Baz controller
+    Creator->>Creator: start foo.rollout and create-foo
+    Creator->>API: create Foo: message + submission context
+    API-->>Creator: accepted; end create-foo
+    API-->>C1: Foo watch notification / queued key
+    C1->>API: GET Foo; extract its annotation context
+    C1->>C1: start reconcile; do demo work
+    C1->>API: create Bar: message + CURRENT span context + owner reference
+    C1->>API: Foo status: observedGeneration + childName
+    C1->>C1: end reconcile
+    API-->>C2: Bar watch notification / queued key
+    C2->>API: GET Bar; extract its annotation context
+    C2->>API: create Baz: message + CURRENT span context + owner reference
+    C2->>API: Bar status: observedGeneration + childName
+    C2->>C2: end reconcile
+    API-->>C3: Baz watch notification / queued key
+    C3->>API: GET Baz; extract context, do work, publish completion
+    C3->>C3: end reconcile
+    Creator->>API: poll Foo → Bar → Baz for completion of this operation
+    Creator->>Creator: ready; end foo.rollout
 ```
 
-## Steps
+The three Deployments watch **different kinds**:
 
-1. **Install prerequisites** (once per cluster) — cert-manager and the
-   OpenTelemetry Operator. See the comments at the top of
-   `manifests/02-otel-collector-sidecar.yaml` for the exact commands.
+| Controller | Watches | Creates |
+| --- | --- | --- |
+| 1 | Foo | Bar |
+| 2 | Bar | Baz |
+| 3 | Baz | No further resource; records completion |
 
-2. **Apply the CRD, RBAC, and the sidecar CR:**
+All three kinds share the same minimal spec:
+
+```yaml
+apiVersion: example.com/v1
+kind: Foo  # The next two objects are Bar and Baz.
+metadata:
+  name: foo-chain
+spec:
+  message: hello
+```
+
+There is no machine provisioning or domain model. Trace context and experiment
+settings live in annotations. For example, **Bar** is created with:
+
+```yaml
+metadata:
+  annotations:
+    tracing.example.com/traceparent: 00-<trace-id>-<foo-controller-span-id>-01
+    tracing.example.com/generation: "1"
+    tracing.example.com/operation-id: <rollout-trace-id>
+    tracing.example.com/root-uid: <foo-uid>
+    tracing.example.com/root-generation: "1"
+  ownerReferences:
+    - apiVersion: example.com/v1
+      kind: Foo
+      name: foo-chain
+      uid: <foo-uid>
+      controller: true
+spec:
+  message: hello
+```
+
+Bar's controller extracts this context, starts its own reconcile span, and
+injects that new span's context when creating Baz. **Each child spec and its
+trace annotations are written together in a single Create request.** Owner
+references express ownership and allow [Kubernetes garbage collection](https://kubernetes.io/docs/concepts/overview/working-with-objects/owners-dependents/).
+They do not propagate trace context.
+
+Each object stores its own `status.attempts`, `status.lastTraceID`, and
+`status.observedGeneration`. Foo and Bar also store `status.childName`. Their
+observedGeneration means **this controller finished its handoff**, not that the
+whole chain is ready. The creator follows both child pointers and waits until
+Baz completes, checking ownership and the originating Foo UID/generation.
+
+Child names are deterministic per parent UID and generation. A retry reuses its
+own existing child without overwriting the original creating span's annotation.
+If creation succeeded but the parent's status write failed, the child may point
+to that earlier attempt rather than the later successful status-writing attempt.
+That preserves the actual creating context. A new Foo generation creates a new
+Bar, which creates a new Baz; prior generations' children remain available for
+inspection until their owner is deleted. This is tracing lab behavior, not a
+rolling-update or replica management implementation.
+
+Experiment controls are separate from the spec:
+
+| Creator environment variable | Annotation propagated to children |
+| --- | --- |
+| `TRACING_MODE` | `tracing.example.com/mode` |
+| `DELAY_MILLIS` | `tracing.example.com/delay-millis` |
+| `FAIL_STAGE` | `tracing.example.com/fail-stage` |
+| `FAIL_ATTEMPTS` | `tracing.example.com/fail-attempts` |
+
+The creator translates its environment into annotations on Foo. The same controls
+are inherited by Bar and Baz, so failure at stage 2 is a failure reconciling Bar.
+Changing controls alone does not start a new operation on an already-completed
+resource; use a new Foo or a new message/spec generation.
+
+A watch notification prompts reconciliation of **current state**. It is not an
+RPC from one controller to another. Keys can be coalesced, retries can happen,
+and controllers can restart. That is why stages check persisted progress before
+emitting spans. See [Kubernetes controllers](https://kubernetes.io/docs/concepts/architecture/controller/).
+
+## When does a span end? What is a rollout span?
+
+`span.End()` ends that one span. In this lab:
+
+| Span | Starts | Ends |
+| --- | --- | --- |
+| `foo.rollout` | Creator begins one desired-state operation | Ready, timeout, superseded, cancellation, or API error |
+| `create-foo` / `update-foo` | Creator submits the object | Kubernetes API call returns, including on error |
+| `controllerN.reconcile` | Eligible worker attempt begins | Work, child creation (if any), and the status write finish, including on error |
+| `write-to-disk` | Work begins inside an attempt | Delay and file write finish, or work fails |
+
+`foo.rollout` is an **application-defined duration**, not a special OTel span type
+or a Kubernetes built-in trace. Here it measures how long the creator observes
+one Foo → Bar → Baz operation taking to become ready. It uses bounded polling
+and checks the object's UID and generation, so it cannot mistake a later rollout for its own.
+A submission may succeed while the rollout later times out.
+
+There is **no whole-trace `End()`**. A child can start after its parent ended;
+ending a parent does not cancel children. The span graph represents relationships,
+not necessarily synchronous temporal nesting. Exporters send completed spans;
+a backend may receive later spans with the same trace ID. Backend retention,
+late-arrival handling and tail-sampling windows still limit what you will see.
+See the [OpenTelemetry tracing API](https://opentelemetry.io/docs/specs/otel/trace/api/).
+
+Do not keep a reconcile span open across several retries or while waiting for a
+cloud operation for hours. End each attempt and persist an operation ID/context
+for the next attempt. A rollout span is useful only when a component actually
+owns a bounded observation interval. This demo's creator owns it; restarting the
+creator does not reconstruct an unexported span. A production controller-owned
+rollout needs a deliberate recovery design, persistent timestamps/operation IDs,
+and often durable status plus metrics for availability across restarts.
+
+## One trace or linked traces? When to start a new trace?
+
+The lab offers both policies so you can inspect their different meanings.
+
+**`TRACING_MODE=child`** keeps the whole operation in one trace:
+
+```text
+foo.rollout                                  [creator]
+└─ create-foo                                [creator; ends at API response]
+   └─ controller1.reconcile                   [controller1]
+      ├─ write-to-disk
+      ├─ controller2.reconcile attempt 1 ERROR
+      │  └─ write-to-disk ERROR
+      ├─ controller2.reconcile attempt 2 ERROR
+      │  └─ write-to-disk ERROR
+      └─ controller2.reconcile attempt 3
+         ├─ write-to-disk
+         └─ controller3.reconcile
+            └─ write-to-disk
+```
+
+Retries have distinct span IDs, and follow the same successful upstream handoff.
+The successful attempt hands its context to the next stage. They do not reuse
+one span or automatically form a retry-to-retry chain. This policy suits this
+controlled sequential pipeline; it does not prove arbitrary Kubernetes event
+causality.
+
+**`TRACING_MODE=linked`** starts a new trace per reconcile attempt and links its
+root span to the upstream handoff. Work spans remain children of their local
+attempt. The creator's rollout remains in its own trace. Follow links or inspect
+each resource's `status.lastTraceID` and logs to find the other traces. They do not
+appear as one nested waterfall; link navigation depends on the Grafana version.
+This is useful when work is asynchronous, long delayed, retried or coalesced.
+For fan-in, a span can have links to multiple causes; it has only one parent.
+This lab implements a sequential pipeline, not fan-in or fan-out scheduling.
+
+Suggested policy boundaries:
+
+| Situation | Policy |
+| --- | --- |
+| Direct request or controlled stage of the same bounded operation | Continue the trace if one waterfall is useful |
+| Retry of that stage | New span; same upstream parent or link |
+| New user spec change / new desired-state operation | New trace; optionally link to the previous operation |
+| Missing/invalid context | New root span; never invent a span ID from the object UID |
+| Later resync or status-only event, with nothing to do | No new span in this lab |
+| Independent repair after readiness, scheduled maintenance, deletion | Usually a new trace; link old context if useful |
+| Multiple independent input changes coalesced by a queue | Consider a new trace with links to known causes |
+
+One trace for an object's entire lifetime becomes huge and mixes unrelated
+operations. `uid` identifies an object instance, `generation` identifies desired
+state, and `resourceVersion` protects an individual API write. They are useful
+attributes; none is a trace ID. Status writes use the status subresource, so they
+do not increment generation.
+
+The creator writes the new spec and annotation context atomically. It binds that
+context to the expected generation. If you edit the spec using plain `kubectl`
+and leave old annotations in place, controller 1 starts a new root instead of
+joining the old trace. That root is then handed down to controllers 2 and 3.
+Existing objects with unqualified `traceparent` annotations from the old demo
+also take this fallback; new creator jobs use qualified annotation keys.
+
+## Deploy the lab
+
+Use a test cluster and check your selected context first. The manifests use the
+`default` namespace, local images, demo RBAC, ephemeral Tempo storage and anonymous
+Grafana access.
+
+1. Install cert-manager and the OpenTelemetry Operator using their installation
+   instructions (links/commands are in `manifests/02-otel-collector-sidecar.yaml`).
+   Wait for their deployments and webhooks to be ready.
+2. Apply the infrastructure and updated CRD:
+
    ```bash
+   kubectl config current-context
    kubectl apply -f manifests/00-crd.yaml
+   kubectl wait --for=condition=Established crd/foos.example.com crd/bars.example.com crd/bazs.example.com --timeout=60s
    kubectl apply -f manifests/01-rbac.yaml
    kubectl apply -f manifests/02-otel-collector-sidecar.yaml
-   ```
-
-3. **Deploy Tempo (and optionally Grafana):**
-   ```bash
    kubectl apply -f manifests/05-tempo.yaml
-   kubectl apply -f manifests/06-grafana.yaml   # optional but recommended
+   kubectl apply -f manifests/06-grafana.yaml
+   kubectl rollout status deploy/tempo --timeout=120s
    ```
 
-4. **Build and load the images:**
+3. Build images and load them into your cluster:
+
    ```bash
-   chmod +x build.sh
-   ./build.sh
+   ./build.sh                             # build only
+   # Or choose one destination:
+   LOAD_TARGET=kind ./build.sh
+   # LOAD_TARGET=minikube ./build.sh
+   # LOAD_TARGET=k3d K3D_CLUSTER=my-cluster ./build.sh
+   # LOAD_TARGET=ssh REMOTE_NODES='node-01 node-02' ./build.sh
    ```
-   This runs `go mod tidy` (needs network access to the Go module proxy —
-   run it locally, not in a sandboxed environment without internet), then
-   builds both Docker images and loads them into whichever local cluster
-   tool it detects (kind/minikube/k3d). If you're using a remote cluster,
-   push the images to a registry instead and update the `image:` fields in
-   `manifests/03-creator-job.yaml` and `manifests/04-controller-deployment.yaml`.
 
-5. **Deploy the controller, then run the creator job:**
+   The SSH option preserves the original containerd import workflow, now selected
+   explicitly. For a registry-based cluster, push images and change manifest image
+   fields. `go.sum` is included for reproducible dependency resolution.
+
+4. Start the three controllers and submit the first operation:
+
    ```bash
    kubectl apply -f manifests/04-controller-deployment.yaml
+   kubectl rollout status deploy/foo-controller --timeout=120s
+   kubectl rollout status deploy/foo-controller-2 --timeout=120s
+   kubectl rollout status deploy/foo-controller-3 --timeout=120s
    kubectl apply -f manifests/03-creator-job.yaml
+   kubectl logs -f job/foo-creator
+   kubectl get foos.example.com,bars.example.com,bazs.example.com
+   kubectl get foo foo-chain -o yaml
    ```
 
-6. **Get the trace ID:**
-   ```bash
-   kubectl logs job/foo-creator | grep "trace id"
-   ```
+The controller Pods use injected collector sidecars. Short-lived creator Jobs
+export directly to Tempo: a classic injected sidecar can keep a completed Job
+running. The creator ends spans before flushing the SDK, on success and errors.
+Both paths export the same OTLP data to the same backend.
 
-7. **View the trace:**
-   - **Via Grafana**: port-forward and open Explore.
-     ```bash
-     kubectl port-forward svc/grafana 3000:3000
-     ```
-     Open http://localhost:3000, pick the **Tempo** datasource in Explore,
-     and paste the trace ID.
-   - **Via the Tempo API directly** (no Grafana needed):
-     ```bash
-     kubectl port-forward svc/tempo 3200:3200
-     curl -s http://localhost:3200/api/traces/<TRACE_ID> | jq .
-     ```
+Rebuilding a `:local` image does not replace an existing Pod. Reload the image and
+restart the three Deployments before testing new code.
 
-You should see one trace containing:
-- `create-foo` (from `crd-creator`)
-- `reconcile-foo` (from `foo-controller`), as a child span
-  - `write-to-disk` (child of `reconcile-foo`)
+## Experiments and expected results
 
-## Checking the reconciled output
-
-The controller writes `/tmp/foo-<namespace>-<name>.json` inside its own
-container. Since the image is distroless (no shell), use an ephemeral
-debug container to peek at it:
+Run one scenario at a time with the helper (requires `kubectl` and Python 3):
 
 ```bash
-kubectl debug -it deploy/foo-controller --image=busybox --target=controller -- sh
-# inside the debug shell:
-cat /proc/1/root/tmp/foo-*.json
+./scripts/run-scenario.sh retry
+# Copy the printed Job name:
+kubectl logs -f job/<printed-job-name>
 ```
 
-## Notes / things you may want to tune
+The helper creates unique Job/Foo names and disables Job retries so a failed
+rollout is easy to inspect. The YAML files can also be applied directly, using
+the fixed names shown below. Do not apply all scenario manifests recursively:
+`update` depends on `foo-chain` already existing, and timeout intentionally fails.
 
-- Tempo and its data volume here use `emptyDir`, so traces disappear if the
-  pod restarts — fine for this experiment, not for real use.
-- The sidecar pattern means each pod talks to `localhost:4317`. If you'd
-  rather skip the sidecar entirely, point `OTEL_EXPORTER_OTLP_ENDPOINT` at
-  `tempo.default.svc.cluster.local:4317` directly and drop the
-  `sidecar.opentelemetry.io/inject` annotations — one less moving part,
-  same result, just no per-pod batching/isolation.
-- `go.sum` isn't included — `build.sh` generates it via `go mod tidy`,
-  which needs network access to the Go module proxy.
+| Scenario | Direct manifest | What to look for |
+| --- | --- | --- |
+| `chain` | `manifests/03-creator-job.yaml` | Three controllers, one trace, one successful rollout |
+| `retry` | `manifests/scenarios/retry.yaml` | Stage 2 fails twice, then succeeds; three sibling attempt spans |
+| `linked` | `manifests/scenarios/linked.yaml` | New trace for each attempt, linked to upstream; one injected retry |
+| `missing` | `manifests/scenarios/missing.yaml` | Creator trace separate from a new controller root |
+| `invalid` | `manifests/scenarios/invalid.yaml` | Same fallback, without crashing or accepting invalid context |
+| `unsampled` | `manifests/scenarios/unsampled.yaml` | Creator visible; controller IDs in logs/status but no exported controller spans |
+| `timeout` | `manifests/scenarios/timeout.yaml` | Creator Job fails after a 1s readiness wait; controllers finish later |
+| `slow` | `manifests/scenarios/slow.yaml` | 5s work per stage: time to restart a controller or supersede the operation |
+| `update` | `manifests/scenarios/update.yaml` | Same Foo UID, higher generation, new rollout trace linked to the previous operation |
+
+For a **new generation**, first complete the initial `foo-chain` operation:
+
+```bash
+./scripts/run-scenario.sh update foo-chain
+```
+
+The helper changes `MESSAGE` each time, so repeated updates create distinct
+spec changes. Applying the fixed update YAML again does not rerun its completed
+Job; prefer the helper for repeat experiments.
+
+For **supersession**, start `slow`, read its Foo name from logs, then run `update`
+against it while the first rollout is pending. The first creator detects the
+new generation and ends its rollout with `rollout.outcome=superseded`. An old
+attempt's conflicting status write cannot mark the new generation complete;
+the worker fetches current state on retry. Intermediate generations can be
+coalesced: the demo does not promise to execute every submitted change.
+
+For **restart recovery**, start `slow` and restart controller 2 during its work:
+
+```bash
+kubectl rollout restart deploy/foo-controller-2
+```
+
+It lists Bars and resumes from each object's persisted progress. Completed stages
+are skipped, so restarting an already-ready controller should add no spans.
+An interrupted file write/attempt can be repeated; progress is not exactly-once
+execution. Keep one replica per stage: multiple replicas need leader election
+or work partitioning beyond this lab.
+
+For **stale annotations**, after `foo-chain` is ready, submit a plain spec edit:
+
+```bash
+kubectl patch foo foo-chain --type=merge -p '{"spec":{"message":"manual desired-state change"}}'
+```
+
+Controller 1's new trace ID differs from the stored creator trace ID because
+the annotation generation no longer matches. For **deletion during a rollout**,
+delete a pending slow Foo: the creator reports the API error and ends its span.
+There is no finalizer/deletion controller in this lab.
+
+In the timeout experiment, look up the creator's trace again after the controllers
+finish. Their later spans can still use the original trace ID. `rollout.outcome`
+remains `timeout`: it describes the observer's deadline, not cancellation of the
+desired state. Only ended spans are available to the exporter, so a still-running
+rollout will not yet be visible as a completed span.
+
+The unsampled experiment explicitly clears the sampling flag in the persisted
+handoff. The SDK uses `ParentBased(AlwaysSample())`: roots are sampled, but
+children of an unsampled remote parent are not recorded. Propagation and work
+still happen. This flag is a sampling signal, not an instruction to stop work.
+A linked new root makes a separate sampling decision. Head sampling cannot
+recover errors from spans it never recorded; retaining all errors with tail
+sampling requires those candidate spans to reach the collector first.
+
+## Inspect the traces
+
+```bash
+kubectl port-forward svc/grafana 3000:3000
+# Open http://localhost:3000 -> Explore -> Tempo -> trace ID from creator logs
+```
+
+Or query Tempo directly in another terminal:
+
+```bash
+kubectl port-forward svc/tempo 3200:3200
+curl -s http://localhost:3200/api/traces/<TRACE_ID> | jq .
+```
+
+Useful correlation fields are `trace_id`, `span_id`, `k8s.object.uid`,
+`k8s.object.generation`, `controller.stage`, `reconcile.attempt`, and `operation.id`.
+The operation attribute remains the creator rollout ID even when linked spans
+use different trace IDs. For a manual spec edit with stale annotations, it falls
+back to UID plus generation rather than naming an old creator operation.
+After missing/invalid context, read
+Foo's `status.lastTraceID` to find the controller trace.
+Allow a few seconds for SDK/collector batching before treating absent spans as
+lost context. Client-go/API-server HTTP spans are not instrumented in this lab:
+persisting an annotation is separate from tracing API transport calls.
+
+Each stage writes `/tmp/<Kind>-<namespace>-<name>.json` in its own
+container before publishing completion. With distroless images, inspect it
+through an ephemeral debug container if needed. The file is a snapshot taken
+before that stage's status update, not the final state of the object.
+
+## Local checks and scope
+
+```bash
+go test ./...
+go vet ./...
+```
+
+Tests inspect real in-memory OTel span records and use Kubernetes fake clients
+to exercise context propagation, parent/link relationships, error retries,
+readiness, timeout, supersession, generation changes, idle suppression and status
+conflicts, actual child creation and owner/context handoffs. Fake clients do not
+validate CRD schemas or model watch/relist behavior fully; run the manifests on a test cluster for end-to-end verification.
+
+This is an educational lab: one worker per controller, no leader election,
+one child per parent per generation and a local file write, no fan-out/fan-in implementation,
+no controller-owned durable rollout reconstruction, and no production retention
+or sampling pipeline. It intentionally filters completed status-only work;
+production controllers must also handle external drift and referenced inputs
+that can change independently of the top-level object's generation.
